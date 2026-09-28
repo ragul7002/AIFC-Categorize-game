@@ -2,16 +2,30 @@ import { io, Socket } from 'socket.io-client';
 import { clientGameEngine } from './clientGameEngine';
 import { isSupabaseConfigured, supabase } from './supabase';
 
-const envServerUrl = (import.meta as any).env?.VITE_SERVER_URL;
-const isLocalhost =
+const isLocalBrowser =
   typeof window !== 'undefined' &&
-  (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1');
+  (window.location.hostname === 'localhost' ||
+    window.location.hostname === '127.0.0.1' ||
+    window.location.hostname === '0.0.0.0');
 
-// Only use local socket.io server if explicitly on localhost with dev port or if VITE_SERVER_URL is provided
-export const SERVER_URL =
-  envServerUrl || (isLocalhost ? `http://${window.location.hostname}:3001` : '');
+const rawEnvUrl = (((import.meta as any).env?.VITE_SERVER_URL || '') as string).trim();
 
-export const hasLiveBackend = Boolean(envServerUrl || isLocalhost);
+// A remote URL must be HTTPS and not reference localhost/loopback
+const isRemoteUrl =
+  rawEnvUrl.startsWith('https://') &&
+  !rawEnvUrl.includes('localhost') &&
+  !rawEnvUrl.includes('127.0.0.1');
+
+// Only use a server URL if it's a valid remote HTTPS backend or if we are actively developing on localhost
+export const SERVER_URL: string = isRemoteUrl
+  ? rawEnvUrl
+  : isLocalBrowser
+  ? rawEnvUrl || `http://${window.location.hostname}:3001`
+  : '';
+
+export const hasLiveBackend: boolean = Boolean(
+  (isRemoteUrl && SERVER_URL) || (isLocalBrowser && SERVER_URL)
+);
 
 class UnifiedSocketService {
   private socket: Socket | null = null;
@@ -19,14 +33,14 @@ class UnifiedSocketService {
   private listeners: Map<string, Set<Function>> = new Map();
 
   constructor() {
-    if (hasLiveBackend && SERVER_URL) {
+    if (hasLiveBackend && SERVER_URL && (isRemoteUrl || isLocalBrowser)) {
       try {
         this.socket = io(SERVER_URL, {
           autoConnect: true,
           reconnection: true,
-          reconnectionAttempts: 3,
+          reconnectionAttempts: 2,
           reconnectionDelay: 1500,
-          timeout: 4000,
+          timeout: 3000,
           transports: ['websocket', 'polling'],
         });
 
