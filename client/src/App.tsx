@@ -1,5 +1,7 @@
 import React, { useState, useEffect } from 'react';
-import { socketService, SERVER_URL } from './services/socket';
+import { socketService, SERVER_URL, hasLiveBackend } from './services/socket';
+import { clientStorage } from './services/clientStorage';
+import { clientGameEngine } from './services/clientGameEngine';
 import { LandingPage } from './views/LandingPage';
 import { HostDashboard } from './views/HostDashboard';
 import { PlayerGameView } from './views/PlayerGameView';
@@ -13,8 +15,8 @@ export const App: React.FC = () => {
   const [hostToken, setHostToken] = useState<string>('');
   const [hostRoomCode, setHostRoomCode] = useState<string>('');
   const [hostState, setHostState] = useState<HostDashboardState | null>(null);
-  const [questions, setQuestions] = useState<Question[]>([]);
-  const [quizQuestions, setQuizQuestions] = useState<QuizQuestion[]>([]);
+  const [questions, setQuestions] = useState<Question[]>(() => clientStorage.getQuestions());
+  const [quizQuestions, setQuizQuestions] = useState<QuizQuestion[]>(() => clientStorage.getQuizQuestions());
 
   // Player state
   const [playerRoomCode, setPlayerRoomCode] = useState<string>('');
@@ -95,28 +97,38 @@ export const App: React.FC = () => {
 
   // Load questions for host
   const fetchQuestions = async () => {
-    try {
-      const res = await fetch(`${SERVER_URL}/api/questions`);
-      if (res.ok) {
-        const data = await res.json();
-        setQuestions(data);
+    if (hasLiveBackend && SERVER_URL) {
+      try {
+        const res = await fetch(`${SERVER_URL}/api/questions`);
+        if (res.ok) {
+          const data = await res.json();
+          setQuestions(data);
+          clientStorage.saveQuestions(data);
+          return;
+        }
+      } catch (err) {
+        // Fallback gracefully without throwing
       }
-    } catch (err) {
-      console.error('Failed to fetch questions:', err);
     }
+    setQuestions(clientStorage.getQuestions());
   };
 
   // Load quiz questions for host
   const fetchQuizQuestions = async () => {
-    try {
-      const res = await fetch(`${SERVER_URL}/api/quiz-questions`);
-      if (res.ok) {
-        const data = await res.json();
-        setQuizQuestions(data);
+    if (hasLiveBackend && SERVER_URL) {
+      try {
+        const res = await fetch(`${SERVER_URL}/api/quiz-questions`);
+        if (res.ok) {
+          const data = await res.json();
+          setQuizQuestions(data);
+          clientStorage.saveQuizQuestions(data);
+          return;
+        }
+      } catch (err) {
+        // Fallback gracefully without throwing
       }
-    } catch (err) {
-      console.error('Failed to fetch quiz questions:', err);
     }
+    setQuizQuestions(clientStorage.getQuizQuestions());
   };
 
   useEffect(() => {
@@ -129,44 +141,53 @@ export const App: React.FC = () => {
     setIsCreating(true);
     setConnectedPlayers([]);
     try {
-      // Ensure questions & quiz questions are loaded
-      let currentQuestions = questions;
-      if (currentQuestions.length === 0) {
-        const qRes = await fetch(`${SERVER_URL}/api/questions`);
-        if (qRes.ok) {
-          currentQuestions = await qRes.json();
-          setQuestions(currentQuestions);
+      let currentQuestions = questions.length > 0 ? questions : clientStorage.getQuestions();
+      let currentQuizQuestions = quizQuestions.length > 0 ? quizQuestions : clientStorage.getQuizQuestions();
+
+      let roomCode = '';
+      let createdHostToken = '';
+      let initialHostState: HostDashboardState | null = null;
+
+      if (hasLiveBackend && SERVER_URL) {
+        try {
+          const res = await fetch(`${SERVER_URL}/api/games`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              title,
+              defaultTimeLimitSeconds: defaultTimeLimit,
+              questions: currentQuestions,
+              quizQuestions: currentQuizQuestions,
+            }),
+          });
+
+          if (res.ok) {
+            const data = await res.json();
+            roomCode = data.roomCode;
+            createdHostToken = data.hostToken;
+          }
+        } catch (e) {
+          // Backend offline - use clientGameEngine
         }
       }
 
-      let currentQuizQuestions = quizQuestions;
-      if (currentQuizQuestions.length === 0) {
-        const qqRes = await fetch(`${SERVER_URL}/api/quiz-questions`);
-        if (qqRes.ok) {
-          currentQuizQuestions = await qqRes.json();
-          setQuizQuestions(currentQuizQuestions);
-        }
-      }
-
-      const res = await fetch(`${SERVER_URL}/api/games`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
+      // If no backend room, create client room
+      if (!roomCode) {
+        const localRoom = clientGameEngine.createRoom(
           title,
-          defaultTimeLimitSeconds: defaultTimeLimit,
-          questions: currentQuestions,
-          quizQuestions: currentQuizQuestions,
-        }),
-      });
+          currentQuestions,
+          currentQuizQuestions,
+          defaultTimeLimit
+        );
+        roomCode = localRoom.roomCode;
+        createdHostToken = localRoom.hostToken;
+      }
 
-      if (!res.ok) throw new Error('Failed to create game room');
-      const data = await res.json();
-
-      setHostRoomCode(data.roomCode);
-      setHostToken(data.hostToken);
+      setHostRoomCode(roomCode);
+      setHostToken(createdHostToken);
 
       // Register socket as host
-      socket.emit('host:register', { roomCode: data.roomCode, hostToken: data.hostToken }, (authRes: any) => {
+      socket.emit('host:register', { roomCode, hostToken: createdHostToken }, (authRes: any) => {
         if (authRes?.success) {
           if (authRes.state) {
             setHostState(authRes.state);
@@ -247,26 +268,35 @@ export const App: React.FC = () => {
   const handleSaveQuestion = async (q: Partial<Question>) => {
     try {
       const isEdit = !!q.id;
-      const url = isEdit ? `${SERVER_URL}/api/questions/${q.id}` : `${SERVER_URL}/api/questions`;
-      const method = isEdit ? 'PUT' : 'POST';
+      let updated: Question[] = [];
 
-      const res = await fetch(url, {
-        method,
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(q),
-      });
+      if (isEdit) {
+        updated = questions.map((item) => (item.id === q.id ? ({ ...item, ...q } as Question) : item));
+      } else {
+        const newQ: Question = {
+          id: 'q_' + Math.random().toString(36).substring(2, 9),
+          title: q.title || 'New Question',
+          timeLimitSeconds: q.timeLimitSeconds || 35,
+          categories: q.categories || [],
+          items: q.items || [],
+        };
+        updated = [...questions, newQ];
+      }
 
-      if (res.ok) {
-        await fetchQuestions();
-        const qRes = await fetch(`${SERVER_URL}/api/questions`);
-        if (qRes.ok) {
-          const updated = await qRes.json();
-          setQuestions(updated);
-          // Sync questions to current active room immediately
-          if (hostRoomCode) {
-            socket.emit('host:update_questions', { roomCode: hostRoomCode, questions: updated });
-          }
-        }
+      setQuestions(updated);
+      clientStorage.saveQuestions(updated);
+
+      if (hostRoomCode) {
+        socket.emit('host:update_questions', { roomCode: hostRoomCode, questions: updated });
+      }
+
+      if (hasLiveBackend && SERVER_URL) {
+        const url = isEdit ? `${SERVER_URL}/api/questions/${q.id}` : `${SERVER_URL}/api/questions`;
+        await fetch(url, {
+          method: isEdit ? 'PUT' : 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(q),
+        }).catch(() => {});
       }
     } catch (err) {
       console.error('Error saving question:', err);
@@ -282,19 +312,18 @@ export const App: React.FC = () => {
     newQuestions.splice(targetIndex, 0, moved);
 
     setQuestions(newQuestions);
+    clientStorage.saveQuestions(newQuestions);
 
     if (hostRoomCode) {
       socket.emit('host:update_questions', { roomCode: hostRoomCode, questions: newQuestions });
     }
 
-    try {
-      await fetch(`${SERVER_URL}/api/questions/reorder`, {
+    if (hasLiveBackend && SERVER_URL) {
+      fetch(`${SERVER_URL}/api/questions/reorder`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ questions: newQuestions }),
-      });
-    } catch (err) {
-      console.error('Error saving reordered questions:', err);
+      }).catch(() => {});
     }
   };
 
@@ -307,19 +336,18 @@ export const App: React.FC = () => {
 
     const newQuestions = questions.map((q) => (q.id === questionId ? updatedQuestion : q));
     setQuestions(newQuestions);
+    clientStorage.saveQuestions(newQuestions);
 
     if (hostRoomCode) {
       socket.emit('host:update_questions', { roomCode: hostRoomCode, questions: newQuestions });
     }
 
-    try {
-      await fetch(`${SERVER_URL}/api/questions/${questionId}`, {
+    if (hasLiveBackend && SERVER_URL) {
+      fetch(`${SERVER_URL}/api/questions/${questionId}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(updatedQuestion),
-      });
-    } catch (err) {
-      console.error('Error updating shuffled question items:', err);
+      }).catch(() => {});
     }
   };
 
@@ -334,57 +362,50 @@ export const App: React.FC = () => {
       alert('You must have at least one question in the game!');
       return;
     }
-    try {
-      const res = await fetch(`${SERVER_URL}/api/questions/${id}`, { method: 'DELETE' });
-      if (res.ok) {
-        const filtered = questions.filter((q) => q.id !== id);
-        setQuestions(filtered);
-        socket.emit('host:update_questions', { roomCode: hostRoomCode, questions: filtered });
-      }
-    } catch (err) {
-      console.error('Error deleting question:', err);
+    const filtered = questions.filter((q) => q.id !== id);
+    setQuestions(filtered);
+    clientStorage.saveQuestions(filtered);
+
+    if (hostRoomCode) {
+      socket.emit('host:update_questions', { roomCode: hostRoomCode, questions: filtered });
+    }
+
+    if (hasLiveBackend && SERVER_URL) {
+      fetch(`${SERVER_URL}/api/questions/${id}`, { method: 'DELETE' }).catch(() => {});
     }
   };
 
   const handleDuplicateQuestion = async (id: string) => {
-    try {
-      const res = await fetch(`${SERVER_URL}/api/questions/${id}/duplicate`, { method: 'POST' });
-      if (res.ok) {
-        await fetchQuestions();
-        const qRes = await fetch(`${SERVER_URL}/api/questions`);
-        const updated = await qRes.json();
-        socket.emit('host:update_questions', { roomCode: hostRoomCode, questions: updated });
-      }
-    } catch (err) {
-      console.error('Error duplicating question:', err);
+    const target = questions.find((q) => q.id === id);
+    if (!target) return;
+    const duplicated: Question = {
+      ...target,
+      id: 'q_' + Math.random().toString(36).substring(2, 9),
+      title: `${target.title} (Copy)`,
+    };
+    const updated = [...questions, duplicated];
+    setQuestions(updated);
+    clientStorage.saveQuestions(updated);
+
+    if (hostRoomCode) {
+      socket.emit('host:update_questions', { roomCode: hostRoomCode, questions: updated });
     }
   };
 
   const handleRandomizeQuestions = async () => {
     const shuffled = [...questions].sort(() => Math.random() - 0.5);
     setQuestions(shuffled);
-    socket.emit('host:update_questions', { roomCode: hostRoomCode, questions: shuffled });
-    try {
-      await fetch(`${SERVER_URL}/api/questions/reorder`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ questions: shuffled }),
-      });
-    } catch (err) {
-      console.error('Error saving randomized questions:', err);
+    clientStorage.saveQuestions(shuffled);
+    if (hostRoomCode) {
+      socket.emit('host:update_questions', { roomCode: hostRoomCode, questions: shuffled });
     }
   };
 
   const handleResetSeedQuestions = async () => {
-    try {
-      const res = await fetch(`${SERVER_URL}/api/questions/reset-seeds`, { method: 'POST' });
-      if (res.ok) {
-        const seeds = await res.json();
-        setQuestions(seeds);
-        socket.emit('host:update_questions', { roomCode: hostRoomCode, questions: seeds });
-      }
-    } catch (err) {
-      console.error('Error resetting seeds:', err);
+    const { questions: seeds } = clientStorage.resetToSeeds();
+    setQuestions(seeds);
+    if (hostRoomCode) {
+      socket.emit('host:update_questions', { roomCode: hostRoomCode, questions: seeds });
     }
   };
 
@@ -392,25 +413,37 @@ export const App: React.FC = () => {
   const handleSaveQuizQuestion = async (qq: Partial<QuizQuestion>) => {
     try {
       const isEdit = !!qq.id;
-      const url = isEdit ? `${SERVER_URL}/api/quiz-questions/${qq.id}` : `${SERVER_URL}/api/quiz-questions`;
-      const method = isEdit ? 'PUT' : 'POST';
+      let updated: QuizQuestion[] = [];
 
-      const res = await fetch(url, {
-        method,
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(qq),
-      });
+      if (isEdit) {
+        updated = quizQuestions.map((item) => (item.id === qq.id ? ({ ...item, ...qq } as QuizQuestion) : item));
+      } else {
+        const newQQ: QuizQuestion = {
+          id: 'quiz_' + Math.random().toString(36).substring(2, 9),
+          questionText: qq.questionText || qq.text || 'Quiz Question',
+          text: qq.questionText || qq.text || 'Quiz Question',
+          imageUrl: qq.imageUrl || '',
+          options: qq.options || [],
+          correctOption: qq.correctOption || (qq.options && qq.options[0]) || '',
+          timeLimitSeconds: qq.timeLimitSeconds || 20,
+        };
+        updated = [...quizQuestions, newQQ];
+      }
 
-      if (res.ok) {
-        await fetchQuizQuestions();
-        const qqRes = await fetch(`${SERVER_URL}/api/quiz-questions`);
-        if (qqRes.ok) {
-          const updated = await qqRes.json();
-          setQuizQuestions(updated);
-          if (hostRoomCode) {
-            socket.emit('host:update_quiz_questions', { roomCode: hostRoomCode, quizQuestions: updated });
-          }
-        }
+      setQuizQuestions(updated);
+      clientStorage.saveQuizQuestions(updated);
+
+      if (hostRoomCode) {
+        socket.emit('host:update_quiz_questions', { roomCode: hostRoomCode, quizQuestions: updated });
+      }
+
+      if (hasLiveBackend && SERVER_URL) {
+        const url = isEdit ? `${SERVER_URL}/api/quiz-questions/${qq.id}` : `${SERVER_URL}/api/quiz-questions`;
+        await fetch(url, {
+          method: isEdit ? 'PUT' : 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(qq),
+        }).catch(() => {});
       }
     } catch (err) {
       console.error('Error saving quiz question:', err);
@@ -418,32 +451,24 @@ export const App: React.FC = () => {
   };
 
   const handleDeleteQuizQuestion = async (id: string) => {
-    try {
-      const res = await fetch(`${SERVER_URL}/api/quiz-questions/${id}`, { method: 'DELETE' });
-      if (res.ok) {
-        const filtered = quizQuestions.filter((q) => q.id !== id);
-        setQuizQuestions(filtered);
-        if (hostRoomCode) {
-          socket.emit('host:update_quiz_questions', { roomCode: hostRoomCode, quizQuestions: filtered });
-        }
-      }
-    } catch (err) {
-      console.error('Error deleting quiz question:', err);
+    const filtered = quizQuestions.filter((q) => q.id !== id);
+    setQuizQuestions(filtered);
+    clientStorage.saveQuizQuestions(filtered);
+
+    if (hostRoomCode) {
+      socket.emit('host:update_quiz_questions', { roomCode: hostRoomCode, quizQuestions: filtered });
+    }
+
+    if (hasLiveBackend && SERVER_URL) {
+      fetch(`${SERVER_URL}/api/quiz-questions/${id}`, { method: 'DELETE' }).catch(() => {});
     }
   };
 
   const handleResetSeedQuizQuestions = async () => {
-    try {
-      const res = await fetch(`${SERVER_URL}/api/quiz-questions/reset-seeds`, { method: 'POST' });
-      if (res.ok) {
-        const seeds = await res.json();
-        setQuizQuestions(seeds);
-        if (hostRoomCode) {
-          socket.emit('host:update_quiz_questions', { roomCode: hostRoomCode, quizQuestions: seeds });
-        }
-      }
-    } catch (err) {
-      console.error('Error resetting quiz seeds:', err);
+    const { quizQuestions: seeds } = clientStorage.resetToSeeds();
+    setQuizQuestions(seeds);
+    if (hostRoomCode) {
+      socket.emit('host:update_quiz_questions', { roomCode: hostRoomCode, quizQuestions: seeds });
     }
   };
 
