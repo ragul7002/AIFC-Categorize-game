@@ -7,7 +7,7 @@ import {
   HostLivePlayerRow,
 } from '../types';
 import { calculateSubmissionScore, calculateQuizScore } from './scoring';
-import Peer, { DataConnection } from 'peerjs';
+import { globalRelay } from './globalRealtimeRelay';
 
 const ROOMS_STORAGE_KEY = 'aifc_multiplayer_active_rooms';
 
@@ -49,9 +49,8 @@ class ClientGameEngine {
   private rooms: Map<string, LocalRoom> = new Map();
   private broadcastChannel: BroadcastChannel | null = null;
   private eventListeners: Map<string, Set<Function>> = new Map();
-  private peer: Peer | null = null;
-  private peerConnections: Map<string, DataConnection> = new Map();
-  private playerConnectionToHost: DataConnection | null = null;
+  private activeRoomCode: string | null = null;
+  private isHost: boolean = false;
 
   constructor() {
     this.loadRoomsFromStorage();
@@ -76,6 +75,47 @@ class ClientGameEngine {
         }
       });
     }
+
+    // Connect globalRelay events to game engine
+    globalRelay.on('client:player_join_request', (data: any) => {
+      if (this.isHost && this.activeRoomCode === data.roomCode) {
+        const res = this.addPlayer(data.roomCode, data.playerName, data.playerId, data.sessionToken);
+        globalRelay.broadcastEvent(data.roomCode, 'server:player_join_response', {
+          requestId: data.requestId,
+          playerId: data.playerId,
+          response: res,
+        });
+      }
+    });
+
+    globalRelay.on('client:player_submit_round', (data: any) => {
+      if (this.isHost && this.activeRoomCode === data.roomCode) {
+        this.submitRound(data.roomCode, data.playerId, data.answers, data.completionTimeMs || 0);
+      }
+    });
+
+    globalRelay.on('client:player_submit_quiz', (data: any) => {
+      if (this.isHost && this.activeRoomCode === data.roomCode) {
+        this.submitQuiz(data.roomCode, data.playerId, data.selectedOption, data.completionTimeMs || 0);
+      }
+    });
+
+    // Forward global relay broadcast events to local client listeners
+    const relayForwardEvents = [
+      'host:state_update',
+      'player:state_update',
+      'player:joined_room',
+      'player:list_updated',
+      'game:starting_countdown',
+      'game:timer_tick',
+      'player:kicked',
+    ];
+
+    relayForwardEvents.forEach((evt) => {
+      globalRelay.on(evt, (payload: any) => {
+        this.triggerLocal(evt, payload);
+      });
+    });
   }
 
   private loadRoomsFromStorage() {
@@ -89,7 +129,6 @@ class ClientGameEngine {
             if (!this.rooms.has(code)) {
               this.rooms.set(code, r);
             } else {
-              // Update players from storage
               const existing = this.rooms.get(code)!;
               existing.players = { ...existing.players, ...r.players };
               existing.status = r.status;
@@ -124,19 +163,12 @@ class ClientGameEngine {
     if (this.broadcastChannel) {
       try {
         this.broadcastChannel.postMessage({ eventName, payload });
-      } catch (e) {
-        // broadcast error ignored
-      }
+      } catch (e) {}
     }
 
-    // Also send over WebRTC P2P to connected players
-    this.peerConnections.forEach((conn) => {
-      if (conn.open) {
-        try {
-          conn.send({ eventName, payload });
-        } catch (e) {}
-      }
-    });
+    if (this.activeRoomCode) {
+      globalRelay.broadcastEvent(this.activeRoomCode, eventName, payload);
+    }
   }
 
   public on(eventName: string, fn: Function) {
@@ -198,56 +230,19 @@ class ClientGameEngine {
     };
 
     this.rooms.set(roomCode, room);
+    this.activeRoomCode = roomCode;
+    this.isHost = true;
     this.persistRooms();
 
-    // Broadcast room creation
+    globalRelay.subscribeRoom(roomCode);
+
     if (this.broadcastChannel) {
       try {
         this.broadcastChannel.postMessage({ eventName: 'room:sync' });
       } catch (e) {}
     }
 
-    // Initialize Host WebRTC Peer
-    this.initHostPeer(roomCode);
-
     return { roomCode, hostToken };
-  }
-
-  private initHostPeer(roomCode: string) {
-    try {
-      if (this.peer) {
-        this.peer.destroy();
-      }
-
-      const peerId = `aifc_host_${roomCode.toLowerCase()}`;
-      this.peer = new Peer(peerId, {
-        debug: 0,
-      });
-
-      this.peer.on('connection', (conn) => {
-        this.peerConnections.set(conn.peer, conn);
-
-        conn.on('data', (msg: any) => {
-          const { eventName, data, callbackId } = msg || {};
-          if (eventName === 'player:join') {
-            const res = this.addPlayer(data.roomCode, data.playerName);
-            conn.send({ callbackId, response: res });
-          } else if (eventName === 'player:submit_round') {
-            this.submitRound(data.roomCode, data.playerId, data.answers, data.completionTimeMs || 0);
-            conn.send({ callbackId, response: { success: true } });
-          } else if (eventName === 'player:submit_quiz') {
-            this.submitQuiz(data.roomCode, data.playerId, data.selectedOption, data.completionTimeMs || 0);
-            conn.send({ callbackId, response: { success: true } });
-          }
-        });
-
-        conn.on('close', () => {
-          this.peerConnections.delete(conn.peer);
-        });
-      });
-    } catch (err) {
-      console.warn('PeerJS Host initialization error:', err);
-    }
   }
 
   public registerHost(roomCode: string, hostToken: string): { success: boolean; state?: HostDashboardState } {
@@ -257,21 +252,24 @@ class ClientGameEngine {
     if (!room || room.hostToken !== hostToken) {
       return { success: false };
     }
+    this.activeRoomCode = cleanCode;
+    this.isHost = true;
+    globalRelay.subscribeRoom(cleanCode);
     return { success: true, state: this.getHostState(room) };
   }
 
   public addPlayer(
     roomCode: string,
-    playerName: string
+    playerName: string,
+    existingPlayerId?: string,
+    existingSessionToken?: string
   ): { success: boolean; player?: any; sessionToken?: string; players?: any[]; error?: string } {
     const cleanCode = (roomCode || '').trim().toUpperCase();
     this.loadRoomsFromStorage();
 
     let room = this.rooms.get(cleanCode);
 
-    // If room not found directly, check if any room is stored in localStorage
     if (!room && this.rooms.size > 0) {
-      // Find case-insensitive match
       for (const [code, r] of this.rooms.entries()) {
         if (code.toUpperCase() === cleanCode) {
           room = r;
@@ -280,7 +278,6 @@ class ClientGameEngine {
       }
     }
 
-    // If still not found and there is only 1 active room, fallback to that room
     if (!room && this.rooms.size === 1) {
       room = Array.from(this.rooms.values())[0];
     }
@@ -289,8 +286,8 @@ class ClientGameEngine {
       return { success: false, error: 'Game room not found. Please verify the 6-character Room Code.' };
     }
 
-    const playerId = 'p_' + Math.random().toString(36).substring(2, 9);
-    const sessionToken = 'tok_' + Math.random().toString(36).substring(2, 12);
+    const playerId = existingPlayerId || 'p_' + Math.random().toString(36).substring(2, 9);
+    const sessionToken = existingSessionToken || 'tok_' + Math.random().toString(36).substring(2, 12);
 
     const player: LocalPlayer = {
       id: playerId,
@@ -315,9 +312,8 @@ class ClientGameEngine {
     this.broadcast('player:list_updated', { players: playersList });
     this.broadcast('host:state_update', this.getHostState(room));
 
-    // Also send initial player state
     setTimeout(() => {
-      this.triggerLocal('player:state_update', this.getPlayerState(room!, playerId));
+      this.broadcast('player:state_update', this.getPlayerState(room!, playerId));
     }, 50);
 
     return {
@@ -326,6 +322,67 @@ class ClientGameEngine {
       sessionToken,
       players: playersList,
     };
+  }
+
+  public joinPlayerOverNetwork(
+    roomCode: string,
+    playerName: string,
+    callback: (res: any) => void
+  ) {
+    const cleanCode = (roomCode || '').trim().toUpperCase();
+    this.activeRoomCode = cleanCode;
+    globalRelay.subscribeRoom(cleanCode);
+
+    // First attempt local join (if host is in same browser)
+    const localRes = this.addPlayer(cleanCode, playerName);
+    if (localRes.success) {
+      callback(localRes);
+      return;
+    }
+
+    // If host is on a different device, send join request over Global Relay
+    const playerId = 'p_' + Math.random().toString(36).substring(2, 9);
+    const sessionToken = 'tok_' + Math.random().toString(36).substring(2, 12);
+    const requestId = 'req_' + Math.random().toString(36).substring(2, 9);
+
+    let resolved = false;
+
+    const responseHandler = (data: any) => {
+      if (data && (data.requestId === requestId || data.playerId === playerId)) {
+        if (!resolved) {
+          resolved = true;
+          globalRelay.off('server:player_join_response', responseHandler);
+          callback(data.response);
+        }
+      }
+    };
+
+    globalRelay.on('server:player_join_response', responseHandler);
+
+    // Broadcast join request to the Host's device
+    globalRelay.broadcastEvent(cleanCode, 'client:player_join_request', {
+      requestId,
+      roomCode: cleanCode,
+      playerName,
+      playerId,
+      sessionToken,
+    });
+
+    // Timeout fallback after 3.5s
+    setTimeout(() => {
+      if (!resolved) {
+        resolved = true;
+        globalRelay.off('server:player_join_response', responseHandler);
+        // If host was temporarily slow, provide optimistic player entry
+        const fallbackPlayer = { id: playerId, name: playerName, isConnected: true, totalScore: 0 };
+        callback({
+          success: true,
+          player: fallbackPlayer,
+          sessionToken,
+          players: [fallbackPlayer],
+        });
+      }
+    }, 3500);
   }
 
   public startGame(roomCode: string) {
@@ -428,7 +485,19 @@ class ClientGameEngine {
   public submitRound(roomCode: string, playerId: string, answers: Record<string, string>, completionTimeMs: number) {
     const cleanCode = roomCode.trim().toUpperCase();
     const room = this.rooms.get(cleanCode);
-    if (!room || room.status !== 'PLAYING') return;
+
+    if (!room) {
+      // Send over global relay to Host device
+      globalRelay.broadcastEvent(cleanCode, 'client:player_submit_round', {
+        roomCode: cleanCode,
+        playerId,
+        answers,
+        completionTimeMs,
+      });
+      return;
+    }
+
+    if (room.status !== 'PLAYING') return;
 
     const player = room.players[playerId];
     if (!player || player.roundSubmitted) return;
@@ -450,7 +519,19 @@ class ClientGameEngine {
   public submitQuiz(roomCode: string, playerId: string, selectedOption: string, completionTimeMs: number) {
     const cleanCode = roomCode.trim().toUpperCase();
     const room = this.rooms.get(cleanCode);
-    if (!room || room.status !== 'QUIZ_PLAYING') return;
+
+    if (!room) {
+      // Send over global relay to Host device
+      globalRelay.broadcastEvent(cleanCode, 'client:player_submit_quiz', {
+        roomCode: cleanCode,
+        playerId,
+        selectedOption,
+        completionTimeMs,
+      });
+      return;
+    }
+
+    if (room.status !== 'QUIZ_PLAYING') return;
 
     const player = room.players[playerId];
     if (!player || player.quizSubmitted) return;

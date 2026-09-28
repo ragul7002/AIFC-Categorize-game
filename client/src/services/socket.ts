@@ -97,8 +97,9 @@ class UnifiedSocketService {
       const res = clientGameEngine.registerHost(roomCode, hostToken);
       if (callback) callback(res);
     } else if (eventName === 'player:join') {
-      const res = clientGameEngine.addPlayer(roomCode, playerName);
-      if (callback) callback(res);
+      clientGameEngine.joinPlayerOverNetwork(roomCode, playerName, (res: any) => {
+        if (callback) callback(res);
+      });
     } else if (eventName === 'host:start_game') {
       clientGameEngine.startGame(roomCode);
       if (callback) callback({ success: true });
