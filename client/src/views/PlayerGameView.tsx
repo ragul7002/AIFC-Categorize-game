@@ -778,7 +778,7 @@ export const PlayerGameView: React.FC<PlayerGameViewProps> = ({
                 </div>
 
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                  {state.finalLeaderboard.map((entry) => {
+                  {state.finalLeaderboard.map((entry: any) => {
                     const isMe = entry.name === state.playerName;
                     return (
                       <div
@@ -1117,7 +1117,7 @@ export const PlayerGameView: React.FC<PlayerGameViewProps> = ({
               gap: '16px',
             }}
           >
-            {quizQ.options.map((option, idx) => {
+            {quizQ.options.map((option: string, idx: number) => {
               const isSelected = currentSelected === option;
               return (
                 <button
