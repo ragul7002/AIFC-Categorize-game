@@ -7,6 +7,9 @@ import {
   HostLivePlayerRow,
 } from '../types';
 import { calculateSubmissionScore, calculateQuizScore } from './scoring';
+import Peer, { DataConnection } from 'peerjs';
+
+const ROOMS_STORAGE_KEY = 'aifc_multiplayer_active_rooms';
 
 interface LocalPlayer {
   id: string;
@@ -46,16 +49,73 @@ class ClientGameEngine {
   private rooms: Map<string, LocalRoom> = new Map();
   private broadcastChannel: BroadcastChannel | null = null;
   private eventListeners: Map<string, Set<Function>> = new Map();
+  private peer: Peer | null = null;
+  private peerConnections: Map<string, DataConnection> = new Map();
+  private playerConnectionToHost: DataConnection | null = null;
 
   constructor() {
-    if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
-      this.broadcastChannel = new BroadcastChannel('aifc_multiplayer_channel');
-      this.broadcastChannel.onmessage = (event) => {
-        const { eventName, payload } = event.data || {};
-        if (eventName) {
-          this.triggerLocal(eventName, payload);
+    this.loadRoomsFromStorage();
+
+    if (typeof window !== 'undefined') {
+      if ('BroadcastChannel' in window) {
+        this.broadcastChannel = new BroadcastChannel('aifc_multiplayer_channel');
+        this.broadcastChannel.onmessage = (event) => {
+          const { eventName, payload } = event.data || {};
+          if (eventName) {
+            if (eventName === 'room:sync') {
+              this.loadRoomsFromStorage();
+            }
+            this.triggerLocal(eventName, payload);
+          }
+        };
+      }
+
+      window.addEventListener('storage', (e) => {
+        if (e.key === ROOMS_STORAGE_KEY) {
+          this.loadRoomsFromStorage();
         }
-      };
+      });
+    }
+  }
+
+  private loadRoomsFromStorage() {
+    try {
+      const stored = localStorage.getItem(ROOMS_STORAGE_KEY);
+      if (stored) {
+        const parsed = JSON.parse(stored);
+        if (typeof parsed === 'object' && parsed !== null) {
+          Object.keys(parsed).forEach((code) => {
+            const r = parsed[code];
+            if (!this.rooms.has(code)) {
+              this.rooms.set(code, r);
+            } else {
+              // Update players from storage
+              const existing = this.rooms.get(code)!;
+              existing.players = { ...existing.players, ...r.players };
+              existing.status = r.status;
+              existing.currentRoundIndex = r.currentRoundIndex;
+              existing.currentQuizIndex = r.currentQuizIndex;
+              existing.timeRemainingSeconds = r.timeRemainingSeconds;
+              existing.revealLeaderboard = r.revealLeaderboard;
+            }
+          });
+        }
+      }
+    } catch (e) {
+      console.warn('Error loading rooms from storage:', e);
+    }
+  }
+
+  private persistRooms() {
+    try {
+      const plainObj: Record<string, any> = {};
+      this.rooms.forEach((room, code) => {
+        const { timerInterval, ...serializable } = room;
+        plainObj[code] = serializable;
+      });
+      localStorage.setItem(ROOMS_STORAGE_KEY, JSON.stringify(plainObj));
+    } catch (e) {
+      console.warn('Error saving rooms to storage:', e);
     }
   }
 
@@ -65,9 +125,18 @@ class ClientGameEngine {
       try {
         this.broadcastChannel.postMessage({ eventName, payload });
       } catch (e) {
-        // channel error ignored
+        // broadcast error ignored
       }
     }
+
+    // Also send over WebRTC P2P to connected players
+    this.peerConnections.forEach((conn) => {
+      if (conn.open) {
+        try {
+          conn.send({ eventName, payload });
+        } catch (e) {}
+      }
+    });
   }
 
   public on(eventName: string, fn: Function) {
@@ -129,27 +198,103 @@ class ClientGameEngine {
     };
 
     this.rooms.set(roomCode, room);
+    this.persistRooms();
+
+    // Broadcast room creation
+    if (this.broadcastChannel) {
+      try {
+        this.broadcastChannel.postMessage({ eventName: 'room:sync' });
+      } catch (e) {}
+    }
+
+    // Initialize Host WebRTC Peer
+    this.initHostPeer(roomCode);
+
     return { roomCode, hostToken };
   }
 
+  private initHostPeer(roomCode: string) {
+    try {
+      if (this.peer) {
+        this.peer.destroy();
+      }
+
+      const peerId = `aifc_host_${roomCode.toLowerCase()}`;
+      this.peer = new Peer(peerId, {
+        debug: 0,
+      });
+
+      this.peer.on('connection', (conn) => {
+        this.peerConnections.set(conn.peer, conn);
+
+        conn.on('data', (msg: any) => {
+          const { eventName, data, callbackId } = msg || {};
+          if (eventName === 'player:join') {
+            const res = this.addPlayer(data.roomCode, data.playerName);
+            conn.send({ callbackId, response: res });
+          } else if (eventName === 'player:submit_round') {
+            this.submitRound(data.roomCode, data.playerId, data.answers, data.completionTimeMs || 0);
+            conn.send({ callbackId, response: { success: true } });
+          } else if (eventName === 'player:submit_quiz') {
+            this.submitQuiz(data.roomCode, data.playerId, data.selectedOption, data.completionTimeMs || 0);
+            conn.send({ callbackId, response: { success: true } });
+          }
+        });
+
+        conn.on('close', () => {
+          this.peerConnections.delete(conn.peer);
+        });
+      });
+    } catch (err) {
+      console.warn('PeerJS Host initialization error:', err);
+    }
+  }
+
   public registerHost(roomCode: string, hostToken: string): { success: boolean; state?: HostDashboardState } {
-    const room = this.rooms.get(roomCode);
+    const cleanCode = roomCode.trim().toUpperCase();
+    this.loadRoomsFromStorage();
+    const room = this.rooms.get(cleanCode);
     if (!room || room.hostToken !== hostToken) {
       return { success: false };
     }
     return { success: true, state: this.getHostState(room) };
   }
 
-  public addPlayer(roomCode: string, playerName: string): { success: boolean; player?: any; sessionToken?: string; players?: any[] } {
-    const room = this.rooms.get(roomCode);
-    if (!room) return { success: false };
+  public addPlayer(
+    roomCode: string,
+    playerName: string
+  ): { success: boolean; player?: any; sessionToken?: string; players?: any[]; error?: string } {
+    const cleanCode = (roomCode || '').trim().toUpperCase();
+    this.loadRoomsFromStorage();
+
+    let room = this.rooms.get(cleanCode);
+
+    // If room not found directly, check if any room is stored in localStorage
+    if (!room && this.rooms.size > 0) {
+      // Find case-insensitive match
+      for (const [code, r] of this.rooms.entries()) {
+        if (code.toUpperCase() === cleanCode) {
+          room = r;
+          break;
+        }
+      }
+    }
+
+    // If still not found and there is only 1 active room, fallback to that room
+    if (!room && this.rooms.size === 1) {
+      room = Array.from(this.rooms.values())[0];
+    }
+
+    if (!room) {
+      return { success: false, error: 'Game room not found. Please verify the 6-character Room Code.' };
+    }
 
     const playerId = 'p_' + Math.random().toString(36).substring(2, 9);
     const sessionToken = 'tok_' + Math.random().toString(36).substring(2, 12);
 
     const player: LocalPlayer = {
       id: playerId,
-      name: playerName,
+      name: playerName.trim() || 'Player',
       sessionToken,
       socketId: playerId,
       isConnected: true,
@@ -159,6 +304,7 @@ class ClientGameEngine {
     };
 
     room.players[playerId] = player;
+    this.persistRooms();
 
     const playersList = Object.values(room.players).map((p) => ({
       id: p.id,
@@ -169,6 +315,11 @@ class ClientGameEngine {
     this.broadcast('player:list_updated', { players: playersList });
     this.broadcast('host:state_update', this.getHostState(room));
 
+    // Also send initial player state
+    setTimeout(() => {
+      this.triggerLocal('player:state_update', this.getPlayerState(room!, playerId));
+    }, 50);
+
     return {
       success: true,
       player,
@@ -178,10 +329,12 @@ class ClientGameEngine {
   }
 
   public startGame(roomCode: string) {
-    const room = this.rooms.get(roomCode);
+    const cleanCode = roomCode.trim().toUpperCase();
+    const room = this.rooms.get(cleanCode);
     if (!room) return;
 
     room.status = 'STARTING';
+    this.persistRooms();
     this.broadcast('host:state_update', this.getHostState(room));
 
     let count = 3;
@@ -196,6 +349,7 @@ class ClientGameEngine {
         room.status = 'PLAYING';
         room.currentRoundIndex = 0;
         room.timeRemainingSeconds = room.questions[0]?.timeLimitSeconds || room.defaultTimeLimitSeconds;
+        this.persistRooms();
         this.startTimer(room);
         this.broadcastUpdates(room);
       }
@@ -203,7 +357,8 @@ class ClientGameEngine {
   }
 
   public nextRound(roomCode: string) {
-    const room = this.rooms.get(roomCode);
+    const cleanCode = roomCode.trim().toUpperCase();
+    const room = this.rooms.get(cleanCode);
     if (!room) return;
 
     if (room.currentRoundIndex + 1 < room.questions.length) {
@@ -215,6 +370,7 @@ class ClientGameEngine {
         p.roundAnswers = undefined;
       });
       room.timeRemainingSeconds = room.questions[room.currentRoundIndex]?.timeLimitSeconds || room.defaultTimeLimitSeconds;
+      this.persistRooms();
       this.startTimer(room);
       this.broadcastUpdates(room);
     } else {
@@ -223,7 +379,8 @@ class ClientGameEngine {
   }
 
   public startQuiz(roomCode: string) {
-    const room = this.rooms.get(roomCode);
+    const cleanCode = roomCode.trim().toUpperCase();
+    const room = this.rooms.get(cleanCode);
     if (!room) return;
 
     room.status = 'QUIZ_PLAYING';
@@ -236,12 +393,14 @@ class ClientGameEngine {
 
     const currentQuizQ = room.quizQuestions[0];
     room.timeRemainingSeconds = currentQuizQ?.timeLimitSeconds || 25;
+    this.persistRooms();
     this.startTimer(room);
     this.broadcastUpdates(room);
   }
 
   public nextQuiz(roomCode: string) {
-    const room = this.rooms.get(roomCode);
+    const cleanCode = roomCode.trim().toUpperCase();
+    const room = this.rooms.get(cleanCode);
     if (!room) return;
 
     if (room.currentQuizIndex + 1 < room.quizQuestions.length) {
@@ -254,18 +413,21 @@ class ClientGameEngine {
       });
       const q = room.quizQuestions[room.currentQuizIndex];
       room.timeRemainingSeconds = q?.timeLimitSeconds || 25;
+      this.persistRooms();
       this.startTimer(room);
       this.broadcastUpdates(room);
     } else {
       room.status = 'QUIZ_COMPLETED';
       room.revealLeaderboard = true;
       if (room.timerInterval) clearInterval(room.timerInterval);
+      this.persistRooms();
       this.broadcastUpdates(room);
     }
   }
 
   public submitRound(roomCode: string, playerId: string, answers: Record<string, string>, completionTimeMs: number) {
-    const room = this.rooms.get(roomCode);
+    const cleanCode = roomCode.trim().toUpperCase();
+    const room = this.rooms.get(cleanCode);
     if (!room || room.status !== 'PLAYING') return;
 
     const player = room.players[playerId];
@@ -281,11 +443,13 @@ class ClientGameEngine {
       player.totalScore += scoreResult.scoreAwarded;
     }
 
+    this.persistRooms();
     this.broadcastUpdates(room);
   }
 
   public submitQuiz(roomCode: string, playerId: string, selectedOption: string, completionTimeMs: number) {
-    const room = this.rooms.get(roomCode);
+    const cleanCode = roomCode.trim().toUpperCase();
+    const room = this.rooms.get(cleanCode);
     if (!room || room.status !== 'QUIZ_PLAYING') return;
 
     const player = room.players[playerId];
@@ -301,22 +465,27 @@ class ClientGameEngine {
       player.totalScore += result.scoreAwarded;
     }
 
+    this.persistRooms();
     this.broadcastUpdates(room);
   }
 
   public setRevealLeaderboard(roomCode: string, reveal: boolean) {
-    const room = this.rooms.get(roomCode);
+    const cleanCode = roomCode.trim().toUpperCase();
+    const room = this.rooms.get(cleanCode);
     if (!room) return;
     room.revealLeaderboard = reveal;
+    this.persistRooms();
     this.broadcastUpdates(room);
   }
 
   public completeGame(roomCode: string) {
-    const room = this.rooms.get(roomCode);
+    const cleanCode = roomCode.trim().toUpperCase();
+    const room = this.rooms.get(cleanCode);
     if (!room) return;
     room.status = 'GAME_COMPLETED';
     room.revealLeaderboard = true;
     if (room.timerInterval) clearInterval(room.timerInterval);
+    this.persistRooms();
     this.broadcastUpdates(room);
   }
 
@@ -334,6 +503,7 @@ class ClientGameEngine {
         } else if (room.status === 'QUIZ_PLAYING') {
           room.status = 'QUIZ_ROUND_COMPLETED';
         }
+        this.persistRooms();
         this.broadcastUpdates(room);
       }
     }, 1000);
